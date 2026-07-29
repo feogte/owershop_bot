@@ -66,8 +66,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # НАСТРОЙКИ — ЗАПОЛНИТЕ ПЕРЕД ЗАПУСКОМ
 # ==========================================================
 
-BOT_UPDATE = "Обновление 1.08.2026 / 30.07.2026"
-
 BOT_TOKEN = "8854998089:AAHka18Sm5bkUd8zcc96cnFtUKgR9hIe5lk"
 
 # Telegram ID владельца. Узнать можно через @userinfobot.
@@ -634,18 +632,12 @@ class Database:
     async def upsert_user(self, message: Message) -> None:
         await self.upsert_telegram_user(message.from_user)
 
-    async def is_subscription_verified(self, user_id: int) -> bool:
-        async with self.lock:
-            row = self.conn.execute(
-                "SELECT subscription_verified FROM users WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            return bool(row and row["subscription_verified"])
-
-    async def mark_subscription_verified(self, user_id: int) -> None:
+    async def set_subscription_verified(self, user_id: int, verified: bool) -> None:
+        """Сохраняет текущее состояние подписки пользователя."""
         async with self.lock:
             self.conn.execute(
-                "UPDATE users SET subscription_verified = 1, last_seen_at = ? WHERE user_id = ?",
-                (utc_now_iso(), user_id),
+                "UPDATE users SET subscription_verified = ?, last_seen_at = ? WHERE user_id = ?",
+                (1 if verified else 0, utc_now_iso(), user_id),
             )
             self.conn.commit()
 
@@ -1238,7 +1230,9 @@ class Database:
                 """
                 SELECT COUNT(*) AS count,
                        COALESCE(SUM(CASE WHEN payment_method = 'card' THEN final_price_rub ELSE 0 END), 0) AS revenue_rub,
-                       COALESCE(SUM(CASE WHEN payment_method = 'stars' THEN final_price_stars ELSE 0 END), 0) AS revenue_stars
+                       COALESCE(SUM(CASE WHEN payment_method = 'stars' THEN final_price_stars ELSE 0 END), 0) AS revenue_stars,
+                       COALESCE(SUM(CASE WHEN payment_method = 'card' THEN 1 ELSE 0 END), 0) AS rub_orders,
+                       COALESCE(SUM(CASE WHEN payment_method = 'stars' THEN 1 ELSE 0 END), 0) AS stars_orders
                 FROM orders WHERE status = 'approved'
                 """
             ).fetchone()
@@ -1246,6 +1240,9 @@ class Database:
                 "SELECT COUNT(*) AS count FROM orders WHERE status = 'pending'"
             ).fetchone()
             users = self.conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()
+            buyers = self.conn.execute(
+                "SELECT COUNT(DISTINCT user_id) AS count FROM orders WHERE status = 'approved'"
+            ).fetchone()
             top = list(
                 self.conn.execute(
                     """
@@ -1260,15 +1257,24 @@ class Database:
                     """
                 ).fetchall()
             )
+
+        total_revenue_rub = max(0, int(total["revenue_rub"]) - EXCLUDED_TEST_REVENUE_RUB)
+        total_revenue_stars = int(total["revenue_stars"])
+        rub_orders = int(total["rub_orders"])
+        stars_orders = int(total["stars_orders"])
+
         return {
-            "today_count": today["count"],
-            "today_revenue_rub": today["revenue_rub"],
-            "today_revenue_stars": today["revenue_stars"],
-            "total_count": total["count"],
-            "total_revenue_rub": max(0, int(total["revenue_rub"]) - EXCLUDED_TEST_REVENUE_RUB),
-            "total_revenue_stars": total["revenue_stars"],
-            "pending_count": pending["count"],
-            "users_count": users["count"],
+            "today_count": int(today["count"]),
+            "today_revenue_rub": int(today["revenue_rub"]),
+            "today_revenue_stars": int(today["revenue_stars"]),
+            "total_count": int(total["count"]),
+            "total_revenue_rub": total_revenue_rub,
+            "total_revenue_stars": total_revenue_stars,
+            "average_revenue_rub": round(total_revenue_rub / rub_orders) if rub_orders else 0,
+            "average_revenue_stars": round(total_revenue_stars / stars_orders) if stars_orders else 0,
+            "pending_count": int(pending["count"]),
+            "users_count": int(users["count"]),
+            "buyers_count": int(buyers["count"]),
             "top": top,
         }
 
@@ -1485,16 +1491,22 @@ class SubscriptionMiddleware(BaseMiddleware):
         user = getattr(event, "from_user", None)
         if not user or is_owner(user.id):
             return await handler(event, data)
+
         await db.upsert_telegram_user(user)
+
+        # Кнопка проверки подписки должна быть доступна даже неподписанному пользователю.
         if isinstance(event, CallbackQuery) and event.data == "subscription:check":
             return await handler(event, data)
-        if await db.is_subscription_verified(user.id):
+
+        # Проверяем реальное членство при каждом действии. Если пользователь отписался,
+        # доступ сразу блокируется до повторной подписки.
+        subscribed = await check_subscription(user.id)
+        await db.set_subscription_verified(user.id, subscribed)
+        if subscribed:
             return await handler(event, data)
-        if await check_subscription(user.id):
-            await db.mark_subscription_verified(user.id)
-            return await handler(event, data)
+
         if isinstance(event, CallbackQuery):
-            await event.answer("Сначала подпишитесь на канал.", show_alert=True)
+            await event.answer("Вы не подписаны на обязательный канал.", show_alert=True)
             if event.message:
                 await send_subscription_required(event.message)
         elif isinstance(event, Message):
@@ -1700,8 +1712,9 @@ async def show_payment_methods(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "subscription:check")
 async def callback_check_subscription(callback: CallbackQuery, state: FSMContext) -> None:
-    if await check_subscription(callback.from_user.id):
-        await db.mark_subscription_verified(callback.from_user.id)
+    subscribed = await check_subscription(callback.from_user.id)
+    await db.set_subscription_verified(callback.from_user.id, subscribed)
+    if subscribed:
         await callback.answer("Подписка подтверждена!")
         await state.clear()
         if callback.message:
@@ -1720,7 +1733,6 @@ async def command_start(message: Message, state: FSMContext) -> None:
     text = (
         "<b>Добро пожаловать в магазин!</b> 👋\n\n"
         "Здесь можно выбрать товар, отправить чек и дождаться ручного подтверждения администратора."
-        f"\n\n<i>{html.escape(BOT_UPDATE)}</i>"
     )
     if message.from_user and is_owner(message.from_user.id):
         text += "\n\nДля управления магазином используйте /admin."
@@ -2831,12 +2843,13 @@ async def callback_admin_stats(callback: CallbackQuery) -> None:
         "<b>📊 Статистика</b>",
         "",
         f"👥 Пользователей всего: <b>{stats['users_count']}</b>",
+        f"🧑‍💼 Покупателей с подтверждёнными покупками: <b>{stats['buyers_count']}</b>",
         f"⏳ Заявок на проверке: <b>{stats['pending_count']}</b>",
         f"🛒 Заказов сегодня: <b>{stats['today_count']}</b>",
         f"💰 Выручка сегодня: <b>{money(stats['today_revenue_rub'])}</b> / <b>{stars(stats['today_revenue_stars'])}</b>",
         f"📦 Заказов всего: <b>{stats['total_count']}</b>",
         f"💵 Выручка за всё время: <b>{money(stats['total_revenue_rub'])}</b> / <b>{stars(stats['total_revenue_stars'])}</b>",
-        f"🧪 Исключено из общей выручки: <b>{money(EXCLUDED_TEST_REVENUE_RUB)}</b>",
+        f"📈 Средний чек: <b>{money(stats['average_revenue_rub'])}</b> / <b>{stars(stats['average_revenue_stars'])}</b>",
         "",
         "<b>Самые продаваемые товары:</b>",
     ]
